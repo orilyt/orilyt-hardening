@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Orilyt Security Hardening
  * Description: Anti-enumeration WP + rate limit lost password (déployé 2026-04-23 suite campagne ciblée)
- * Version: 1.0
+ * Version: 1.1
  * Author: Orilyt
  */
 
@@ -33,18 +33,44 @@ add_filter('rest_authentication_errors', function ($result) {
 });
 
 // =====================================================================
-// 3. Rate limit + réponse uniformisée lost password
+// 3. Rate limit + réponse uniformisée lost password (v1.1)
 //    - Max 5 POST / 15 min / IP
-//    - Si user n'existe pas : fake success (pas de leak énumération)
+//    - Réponse identique compte existant / inexistant : même URL ET même
+//      temps de réponse. L'email de reset part HORS de la requête, pour
+//      qu'aucun delta de timing (envoi SMTP) ne réénumère les comptes.
+//    - Le hook `login_form_lostpassword` se déclenche AVANT le
+//      retrieve_password() du core (wp-login.php) : on intercepte donc
+//      avant tout envoi, puis on `exit` pour court-circuiter le core.
 // =====================================================================
-add_action('login_form_lostpassword', function () {
-    if (!isset($_SERVER['REQUEST_METHOD']) || $_SERVER['REQUEST_METHOD'] !== 'POST') return;
 
-    $ip = isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '';
+// Envoi du reset hors-requête (utilisé par le fallback non-FPM via wp-cron).
+add_action('olrl_send_reset', function ($user_login) {
+    if (is_string($user_login) && $user_login !== '') {
+        retrieve_password($user_login); // génère la clé + envoie l'email
+    }
+}, 10, 1);
+
+add_action('login_form_lostpassword', function () {
+    if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') return;
+
+    // IP réelle : on ne lit X-Forwarded-For que derrière un proxy de
+    // confiance explicitement déclaré (sinon l'en-tête est spoofable par
+    // le client). rightmost = IP ajoutée par le dernier proxy traversé,
+    // robuste pour UN seul hop (ex. Cloudflare seul). En multi-hop ou
+    // derrière CF, préférer CF-Connecting-IP côté infra.
+    $ip = $_SERVER['REMOTE_ADDR'] ?? '';
+    if (defined('OLRL_TRUST_PROXY') && OLRL_TRUST_PROXY && !empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+        $xff = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']);
+        $ip  = trim(end($xff));
+    }
+
     if ($ip) {
-        $key = 'olrl_' . md5($ip);
+        $key   = 'olrl_' . md5($ip);
         $count = (int) get_transient($key);
         if ($count >= 5) {
+            // Déjà bloqué : on NE réincrémente PAS (sinon le TTL se rafraîchit
+            // à chaque hit → verrou perpétuel, y compris pour une IP partagée).
+            // Sortie identique au cas nominal.
             wp_safe_redirect(wp_login_url() . '?checkemail=confirm');
             exit;
         }
@@ -52,16 +78,34 @@ add_action('login_form_lostpassword', function () {
     }
 
     $user_login = isset($_POST['user_login']) ? trim(wp_unslash($_POST['user_login'])) : '';
-    if ($user_login === '') return;
+    if ($user_login === '') return; // laisse WP afficher son erreur "champ vide"
 
     $user = is_email($user_login)
         ? get_user_by('email', $user_login)
         : get_user_by('login', $user_login);
 
-    if (!$user) {
-        wp_safe_redirect(wp_login_url() . '?checkemail=confirm');
+    // Réponse identique dans les deux cas, émise AVANT tout envoi mail.
+    nocache_headers();
+    wp_safe_redirect(wp_login_url() . '?checkemail=confirm');
+
+    if (function_exists('fastcgi_finish_request')) {
+        // PHP-FPM : on flush la réponse 302 au client, PUIS on envoie le mail
+        // côté serveur. L'envoi SMTP est hors du temps de réponse observable.
+        fastcgi_finish_request();
+        if ($user) {
+            ignore_user_abort(true);
+            retrieve_password($user_login);
+        }
         exit;
     }
+
+    // Fallback (mod_php / LiteSpeed sans fastcgi_finish_request) : on programme
+    // l'envoi hors-requête. Seul écart restant pour un compte valide : une
+    // écriture cron (~1 ms), très en-dessous du jitter réseau.
+    if ($user && !wp_next_scheduled('olrl_send_reset', array($user_login))) {
+        wp_schedule_single_event(time(), 'olrl_send_reset', array($user_login));
+    }
+    exit;
 }, 1);
 
 // =====================================================================
