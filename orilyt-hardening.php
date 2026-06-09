@@ -2,13 +2,13 @@
 /**
  * Plugin Name: Orilyt Security Hardening (installeur)
  * Description: Installe la protection Orilyt en mu-plugin (indésactivable depuis l'admin). Activer ce plugin = protection posée ; le désactiver = protection retirée.
- * Version: 1.1
+ * Version: 1.1.1
  * Author: Orilyt
  */
 
 if (!defined('ABSPATH')) exit;
 
-define('ORILYT_HARDENING_VERSION', '1.1');
+define('ORILYT_HARDENING_VERSION', '1.1.1');
 define('ORILYT_HARDENING_MU_FILE', '0-orilyt-hardening.php');
 
 /**

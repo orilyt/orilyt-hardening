@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Orilyt Security Hardening
  * Description: Anti-enumeration WP + rate limit lost password (déployé 2026-04-23 suite campagne ciblée)
- * Version: 1.1
+ * Version: 1.1.1
  * Author: Orilyt
  */
 
@@ -88,10 +88,16 @@ add_action('login_form_lostpassword', function () {
     nocache_headers();
     wp_safe_redirect(wp_login_url() . '?checkemail=confirm');
 
-    if (function_exists('fastcgi_finish_request')) {
-        // PHP-FPM : on flush la réponse 302 au client, PUIS on envoie le mail
-        // côté serveur. L'envoi SMTP est hors du temps de réponse observable.
-        fastcgi_finish_request();
+    // PHP-FPM expose fastcgi_finish_request(), LiteSpeed expose
+    // litespeed_finish_request() : les deux flushent la réponse 302 au client
+    // PUIS laissent PHP continuer côté serveur. On envoie le mail après ce
+    // flush, donc l'envoi SMTP est hors du temps de réponse observable.
+    $flush = function_exists('fastcgi_finish_request')
+        ? 'fastcgi_finish_request'
+        : (function_exists('litespeed_finish_request') ? 'litespeed_finish_request' : null);
+
+    if ($flush) {
+        $flush();
         if ($user) {
             ignore_user_abort(true);
             retrieve_password($user_login);
@@ -99,8 +105,8 @@ add_action('login_form_lostpassword', function () {
         exit;
     }
 
-    // Fallback (mod_php / LiteSpeed sans fastcgi_finish_request) : on programme
-    // l'envoi hors-requête. Seul écart restant pour un compte valide : une
+    // Fallback (mod_php sans aucune fonction de flush) : on programme l'envoi
+    // hors-requête via wp-cron. Seul écart restant pour un compte valide : une
     // écriture cron (~1 ms), très en-dessous du jitter réseau.
     if ($user && !wp_next_scheduled('olrl_send_reset', array($user_login))) {
         wp_schedule_single_event(time(), 'olrl_send_reset', array($user_login));
